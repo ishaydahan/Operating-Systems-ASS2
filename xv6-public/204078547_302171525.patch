@@ -1,0 +1,1483 @@
+diff --git a/Makefile b/Makefile
+index a635b64..44349cd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -157,6 +157,7 @@ mkfs: mkfs.c fs.h
+ .PRECIOUS: %.o
+ 
+ UPROGS=\
++	_test1\
+ 	_cat\
+ 	_echo\
+ 	_forktest\
+diff --git a/defs.h b/defs.h
+index 34ed633..a5776a7 100644
+--- a/defs.h
++++ b/defs.h
+@@ -115,6 +115,13 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int 			kthread_create(void*(*start_func)(), void* stack, int stack_size);
++void 			kthread_exit();
++int 			kthread_join(int thread_id);
++int 			kthread_mutex_alloc(void);
++int 			kthread_mutex_dealloc(int mutex_id);
++int 			kthread_mutex_lock(int mutex_id);
++int 			kthread_mutex_unlock(int mutex_id);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/exec.c b/exec.c
+index d56ee1d..136c313 100644
+--- a/exec.c
++++ b/exec.c
+@@ -2,6 +2,7 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
+ #include "x86.h"
+@@ -10,6 +11,12 @@
+ int
+ exec(char *path, char **argv)
+ {
++
++  struct thread *t;
++  for(t = proc->threads; t < &proc->threads[NTHREAD] ; t++){
++    if (t!=thread) t->killed=1;
++  }
++
+   char *s, *last;
+   int i, off;
+   uint argc, sz, sp, ustack[3+MAXARG+1];
+@@ -94,8 +101,8 @@ exec(char *path, char **argv)
+   oldpgdir = proc->pgdir;
+   proc->pgdir = pgdir;
+   proc->sz = sz;
+-  proc->tf->eip = elf.entry;  // main
+-  proc->tf->esp = sp;
++  thread->tf->eip = elf.entry;  // main
++  thread->tf->esp = sp;
+   switchuvm(proc);
+   freevm(oldpgdir);
+   return 0;
+diff --git a/fs.c b/fs.c
+index f800b77..5687a26 100644
+--- a/fs.c
++++ b/fs.c
+@@ -14,15 +14,17 @@
+ #include "param.h"
+ #include "stat.h"
+ #include "mmu.h"
+-#include "proc.h"
+ #include "spinlock.h"
++#include "proc.h"
+ #include "fs.h"
+ #include "buf.h"
+ #include "file.h"
+ 
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ static void itrunc(struct inode*);
+-struct superblock sb;   // there should be one per dev, but we run with one dev
++// there should be one superblock per disk device, but we run with
++// only one device
++struct superblock sb; 
+ 
+ // Read the super block.
+ void
+@@ -164,8 +166,10 @@ iinit(int dev)
+ {
+   initlock(&icache.lock, "icache");
+   readsb(dev, &sb);
+-  cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d inodestart %d bmap start %d\n", sb.size,
+-          sb.nblocks, sb.ninodes, sb.nlog, sb.logstart, sb.inodestart, sb.bmapstart);
++  cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d\
++          inodestart %d bmap start %d\n", sb.size, sb.nblocks,
++          sb.ninodes, sb.nlog, sb.logstart, sb.inodestart,
++          sb.bmapstart);
+ }
+ 
+ static struct inode* iget(uint dev, uint inum);
+diff --git a/fs.h b/fs.h
+index e64ecc0..3214f1d 100644
+--- a/fs.h
++++ b/fs.h
+@@ -6,10 +6,11 @@
+ #define BSIZE 512  // block size
+ 
+ // Disk layout:
+-// [ boot block | super block | log | inode blocks | free bit map | data blocks ]
++// [ boot block | super block | log | inode blocks |
++//                                          free bit map | data blocks]
+ //
+-// mkfs computes the super block and builds an initial file system. The super describes
+-// the disk layout:
++// mkfs computes the super block and builds an initial file system. The
++// super block describes the disk layout:
+ struct superblock {
+   uint size;         // Size of file system image (blocks)
+   uint nblocks;      // Number of data blocks
+diff --git a/ide.c b/ide.c
+index 7fad55d..b639798 100644
+--- a/ide.c
++++ b/ide.c
+@@ -5,10 +5,10 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "x86.h"
+ #include "traps.h"
+-#include "spinlock.h"
+ #include "fs.h"
+ #include "buf.h"
+ 
+diff --git a/init.c b/init.c
+index 046b551..23771c5 100644
+--- a/init.c
++++ b/init.c
+@@ -10,6 +10,7 @@ char *argv[] = { "sh", 0 };
+ int
+ main(void)
+ {
++
+   int pid, wpid;
+ 
+   if(open("console", O_RDWR) < 0){
+@@ -22,6 +23,7 @@ main(void)
+   for(;;){
+     printf(1, "init: starting sh\n");
+     pid = fork();
++
+     if(pid < 0){
+       printf(1, "init: fork failed\n");
+       exit();
+diff --git a/lapic.c b/lapic.c
+index 4bf2618..320015d 100644
+--- a/lapic.c
++++ b/lapic.c
+@@ -1,6 +1,7 @@
+ // The local APIC manages internal (non-I/O) interrupts.
+ // See Chapter 8 & Appendix C of Intel processor manual volume 3.
+ 
++#include "param.h"
+ #include "types.h"
+ #include "defs.h"
+ #include "date.h"
+@@ -8,6 +9,8 @@
+ #include "traps.h"
+ #include "mmu.h"
+ #include "x86.h"
++#include "spinlock.h"
++#include "proc.h"  // ncpu
+ 
+ // Local APIC registers, divided by 4 for use as uint[] indices.
+ #define ID      (0x0020/4)   // ID
+@@ -99,6 +102,8 @@ lapicinit(void)
+ int
+ cpunum(void)
+ {
++  int apicid, i;
++  
+   // Cannot call cpu when interrupts are enabled:
+   // result not guaranteed to last long enough to be used!
+   // Would prefer to panic but even printing is chancy here:
+@@ -111,9 +116,15 @@ cpunum(void)
+         __builtin_return_address(0));
+   }
+ 
+-  if(lapic)
+-    return lapic[ID]>>24;
+-  return 0;
++  if (!lapic)
++    return 0;
++
++  apicid = lapic[ID] >> 24;
++  for (i = 0; i < ncpu; ++i) {
++    if (cpus[i].apicid == apicid)
++      return i;
++  }
++  panic("unknown apicid\n");
+ }
+ 
+ // Acknowledge interrupt.
+diff --git a/main.c b/main.c
+index 2972b21..4b4d99e 100644
+--- a/main.c
++++ b/main.c
+@@ -3,6 +3,7 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "x86.h"
+ 
+@@ -22,7 +23,7 @@ main(void)
+   mpinit();        // detect other processors
+   lapicinit();     // interrupt controller
+   seginit();       // segment descriptors
+-  cprintf("\ncpu%d: starting xv6\n\n", cpu->id);
++  cprintf("\ncpu%d: starting xv6\n\n", cpunum());
+   picinit();       // another interrupt controller
+   ioapicinit();    // another interrupt controller
+   consoleinit();   // console hardware
+@@ -54,7 +55,7 @@ mpenter(void)
+ static void
+ mpmain(void)
+ {
+-  cprintf("cpu%d: starting\n", cpu->id);
++  cprintf("cpu%d: starting\n", cpunum());
+   idtinit();       // load idt register
+   xchg(&cpu->started, 1); // tell startothers() we're up
+   scheduler();     // start running processes
+@@ -89,7 +90,7 @@ startothers(void)
+     *(void**)(code-8) = mpenter;
+     *(int**)(code-12) = (void *) V2P(entrypgdir);
+ 
+-    lapicstartap(c->id, V2P(code));
++    lapicstartap(c->apicid, V2P(code));
+ 
+     // wait for cpu to finish mpmain()
+     while(c->started == 0)
+@@ -113,6 +114,3 @@ pde_t entrypgdir[NPDENTRIES] = {
+ //PAGEBREAK!
+ // Blank page.
+ //PAGEBREAK!
+-// Blank page.
+-//PAGEBREAK!
+-// Blank page.
+diff --git a/mp.c b/mp.c
+index 977a823..3dfe073 100644
+--- a/mp.c
++++ b/mp.c
+@@ -9,6 +9,7 @@
+ #include "mp.h"
+ #include "x86.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ 
+ struct cpu cpus[NCPU];
+@@ -106,12 +107,10 @@ mpinit(void)
+     switch(*p){
+     case MPPROC:
+       proc = (struct mpproc*)p;
+-      if(ncpu != proc->apicid){
+-        cprintf("mpinit: ncpu=%d apicid=%d\n", ncpu, proc->apicid);
+-        ismp = 0;
++      if(ncpu < NCPU) {
++        cpus[ncpu].apicid = proc->apicid;  // apicid may differ from ncpu
++        ncpu++;
+       }
+-      cpus[ncpu].id = ncpu;
+-      ncpu++;
+       p += sizeof(struct mpproc);
+       continue;
+     case MPIOAPIC:
+@@ -125,8 +124,8 @@ mpinit(void)
+       p += 8;
+       continue;
+     default:
+-      cprintf("mpinit: unknown config type %x\n", *p);
+       ismp = 0;
++      break;
+     }
+   }
+   if(!ismp){
+diff --git a/picirq.c b/picirq.c
+index ff86831..69785a7 100644
+--- a/picirq.c
++++ b/picirq.c
+@@ -82,3 +82,6 @@ picinit(void)
+   if(irqmask != 0xFFFF)
+     picsetmask(irqmask);
+ }
++
++//PAGEBREAK!
++// Blank page.
+diff --git a/pipe.c b/pipe.c
+index f76ed5c..0d2e54f 100644
+--- a/pipe.c
++++ b/pipe.c
+@@ -2,10 +2,10 @@
+ #include "defs.h"
+ #include "param.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "fs.h"
+ #include "file.h"
+-#include "spinlock.h"
+ 
+ #define PIPESIZE 512
+ 
+diff --git a/proc.c b/proc.c
+index 751d886..0566389 100644
+--- a/proc.c
++++ b/proc.c
+@@ -4,8 +4,8 @@
+ #include "memlayout.h"
+ #include "mmu.h"
+ #include "x86.h"
+-#include "proc.h"
+ #include "spinlock.h"
++#include "proc.h"
+ 
+ struct {
+   struct spinlock lock;
+@@ -14,7 +14,13 @@ struct {
+ 
+ static struct proc *initproc;
+ 
++static struct kthread_mutex_t mutexes[MAX_MUTEXES];
++struct spinlock mlock;
++
+ int nextpid = 1;
++int nexttid = 1;
++int nextmid = 1;
++
+ extern void forkret(void);
+ extern void trapret(void);
+ 
+@@ -24,6 +30,7 @@ void
+ pinit(void)
+ {
+   initlock(&ptable.lock, "ptable");
++  initlock(&mlock, "mutex_lock");
+ }
+ 
+ //PAGEBREAK: 32
+@@ -32,43 +39,51 @@ pinit(void)
+ // state required to run in the kernel.
+ // Otherwise return 0.
+ // Must hold ptable.lock.
+-static struct proc*
+-allocproc(void)
++static struct thread*
++allocthread(void)
+ {
+   struct proc *p;
++  struct thread *t;
++
+   char *sp;
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == UNUSED)
++    if(p->state == PUNUSED)
+       goto found;
+   return 0;
+ 
+ found:
+-  p->state = EMBRYO;
++  p->state = PEMBRYO;
+   p->pid = nextpid++;
+-
++  initlock(&p->plock, "proc_lock");
++  t=&(p->threads[0]);
++  t->state = EMBRYO;
++  t->tid =  nexttid++;
++  t->parent = p; 
++  
+   // Allocate kernel stack.
+-  if((p->kstack = kalloc()) == 0){
+-    p->state = UNUSED;
++  if((t->kstack = kalloc()) == 0){
++    p->state = PUNUSED;
++    t->state = UNUSED;    
+     return 0;
+   }
+-  sp = p->kstack + KSTACKSIZE;
+ 
++  sp = t->kstack + KSTACKSIZE;
++  
+   // Leave room for trap frame.
+-  sp -= sizeof *p->tf;
+-  p->tf = (struct trapframe*)sp;
+-
++  sp -= sizeof *t->tf;
++  t->tf = (struct trapframe*)sp;
++  
+   // Set up new context to start executing at forkret,
+   // which returns to trapret.
+   sp -= 4;
+   *(uint*)sp = (uint)trapret;
+ 
+-  sp -= sizeof *p->context;
+-  p->context = (struct context*)sp;
+-  memset(p->context, 0, sizeof *p->context);
+-  p->context->eip = (uint)forkret;
+-
+-  return p;
++  sp -= sizeof *t->context;
++  t->context = (struct context*)sp;
++  memset(t->context, 0, sizeof *t->context);
++  t->context->eip = (uint)forkret;
++  return t;
+ }
+ 
+ //PAGEBREAK: 32
+@@ -77,29 +92,33 @@ void
+ userinit(void)
+ {
+   struct proc *p;
++  struct thread *t;
+   extern char _binary_initcode_start[], _binary_initcode_size[];
+ 
+   acquire(&ptable.lock);
+ 
+-  p = allocproc();
++  t = allocthread();
++  p = t->parent;
++
+   initproc = p;
+   if((p->pgdir = setupkvm()) == 0)
+     panic("userinit: out of memory?");
+   inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size);
+   p->sz = PGSIZE;
+-  memset(p->tf, 0, sizeof(*p->tf));
+-  p->tf->cs = (SEG_UCODE << 3) | DPL_USER;
+-  p->tf->ds = (SEG_UDATA << 3) | DPL_USER;
+-  p->tf->es = p->tf->ds;
+-  p->tf->ss = p->tf->ds;
+-  p->tf->eflags = FL_IF;
+-  p->tf->esp = PGSIZE;
+-  p->tf->eip = 0;  // beginning of initcode.S
++  memset(t->tf, 0, sizeof(*t->tf));
++  t->tf->cs = (SEG_UCODE << 3) | DPL_USER;
++  t->tf->ds = (SEG_UDATA << 3) | DPL_USER;
++  t->tf->es = t->tf->ds;
++  t->tf->ss = t->tf->ds;
++  t->tf->eflags = FL_IF;
++  t->tf->esp = PGSIZE;
++  t->tf->eip = 0;  // beginning of initcode.S
+ 
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+ 
+-  p->state = RUNNABLE;
++  p->state = PREADY;
++  t->state = RUNNABLE;
+ 
+   release(&ptable.lock);
+ }
+@@ -109,6 +128,7 @@ userinit(void)
+ int
+ growproc(int n)
+ {
++  acquire(&thread->parent->plock);
+   uint sz;
+ 
+   sz = proc->sz;
+@@ -121,6 +141,8 @@ growproc(int n)
+   }
+   proc->sz = sz;
+   switchuvm(proc);
++  release(&thread->parent->plock);
++
+   return 0;
+ }
+ 
+@@ -132,29 +154,32 @@ fork(void)
+ {
+   int i, pid;
+   struct proc *np;
++  struct thread *nt;
+ 
+   acquire(&ptable.lock);
+ 
+   // Allocate process.
+-  if((np = allocproc()) == 0){
++  if((nt = allocthread()) == 0){
+     release(&ptable.lock);
+     return -1;
+   }
++  np = nt->parent;
+ 
+   // Copy process state from p.
+   if((np->pgdir = copyuvm(proc->pgdir, proc->sz)) == 0){
+-    kfree(np->kstack);
+-    np->kstack = 0;
+-    np->state = UNUSED;
++    kfree(nt->kstack);
++    nt->kstack = 0;
++    nt->state = UNUSED;
++    np->state = PUNUSED;
+     release(&ptable.lock);
+     return -1;
+   }
+   np->sz = proc->sz;
+   np->parent = proc;
+-  *np->tf = *proc->tf;
++  *nt->tf = *thread->tf;
+ 
+   // Clear %eax so that fork returns 0 in the child.
+-  np->tf->eax = 0;
++  nt->tf->eax = 0;
+ 
+   for(i = 0; i < NOFILE; i++)
+     if(proc->ofile[i])
+@@ -165,7 +190,8 @@ fork(void)
+ 
+   pid = np->pid;
+ 
+-  np->state = RUNNABLE;
++  np->state = PREADY;
++  nt->state  = RUNNABLE;
+ 
+   release(&ptable.lock);
+ 
+@@ -184,6 +210,11 @@ exit(void)
+   if(proc == initproc)
+     panic("init exiting");
+ 
++  struct thread *t;
++  for(t = proc->threads; t < &proc->threads[NTHREAD] ; t++){
++    if (t!=thread) t->killed=1;
++  }
++
+   // Close all open files.
+   for(fd = 0; fd < NOFILE; fd++){
+     if(proc->ofile[fd]){
+@@ -206,13 +237,14 @@ exit(void)
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->parent == proc){
+       p->parent = initproc;
+-      if(p->state == ZOMBIE)
++      if(p->state == PZOMBIE)
+         wakeup1(initproc);
+     }
+   }
+ 
+   // Jump into the scheduler, never to return.
+-  proc->state = ZOMBIE;
++  proc->state = PZOMBIE;
++  thread->state = UNUSED;
+   sched();
+   panic("zombie exit");
+ }
+@@ -233,17 +265,24 @@ wait(void)
+       if(p->parent != proc)
+         continue;
+       havekids = 1;
+-      if(p->state == ZOMBIE){
++      if(p->state == PZOMBIE){
+         // Found one.
++        struct thread *t;
++        for(t = p->threads; t < &p->threads[NTHREAD] ; t++){
++          if (t->kstack) kfree(t->kstack);
++          t->kstack = 0;
++          t->tid = 0;
++          t->parent = 0;
++          t->killed = 0;
++          t->state = UNUSED;
++        }
+         pid = p->pid;
+-        kfree(p->kstack);
+-        p->kstack = 0;
+         freevm(p->pgdir);
+         p->pid = 0;
+         p->parent = 0;
+         p->name[0] = 0;
+         p->killed = 0;
+-        p->state = UNUSED;
++        p->state = PUNUSED;
+         release(&ptable.lock);
+         return pid;
+       }
+@@ -268,10 +307,10 @@ wait(void)
+ //  - swtch to start running that process
+ //  - eventually that process transfers control
+ //      via swtch back to the scheduler.
+-void
+-scheduler(void)
++void scheduler(void)
+ {
+   struct proc *p;
++  struct thread *t;
+ 
+   for(;;){
+     // Enable interrupts on this processor.
+@@ -280,29 +319,43 @@ scheduler(void)
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->state != RUNNABLE)
++      if(p->state != PREADY){
+         continue;
++      }
+ 
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+       // before jumping back to us.
+       proc = p;
+-      switchuvm(p);
+-      p->state = RUNNING;
+-      swtch(&cpu->scheduler, p->context);
+-      switchkvm();
++      for(t = p->threads; t < &p->threads[NTHREAD]; t++){
++        if(t->state != RUNNABLE){
++          continue;
++        }
++        thread=t;
++        t->state=RUNNING;
++        switchuvm(p);        
++        swtch(&cpu->scheduler, t->context);
++        switchkvm();
++      }
+ 
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       proc = 0;
++      thread = 0;
+     }
++
+     release(&ptable.lock);
+ 
+   }
+ }
+ 
+ // Enter scheduler.  Must hold only ptable.lock
+-// and have changed proc->state.
++// and have changed proc->state. Saves and restores
++// intena because intena is a property of this
++// kernel thread, not this CPU. It should
++// be proc->intena and proc->ncli, but that would
++// break in the few places where a lock is held but
++// there's no process.
+ void
+ sched(void)
+ {
+@@ -312,12 +365,12 @@ sched(void)
+     panic("sched ptable.lock");
+   if(cpu->ncli != 1)
+     panic("sched locks");
+-  if(proc->state == RUNNING)
+-    panic("sched running");
++  if(thread->state == RUNNING)
++    panic("thread running");
+   if(readeflags()&FL_IF)
+     panic("sched interruptible");
+   intena = cpu->intena;
+-  swtch(&proc->context, cpu->scheduler);
++  swtch(&thread->context, cpu->scheduler);
+   cpu->intena = intena;
+ }
+ 
+@@ -326,7 +379,7 @@ void
+ yield(void)
+ {
+   acquire(&ptable.lock);  //DOC: yieldlock
+-  proc->state = RUNNABLE;
++  thread->state = RUNNABLE;
+   sched();
+   release(&ptable.lock);
+ }
+@@ -357,6 +410,8 @@ forkret(void)
+ void
+ sleep(void *chan, struct spinlock *lk)
+ {
++  struct proc *proc = thread -> parent; //overide proc global var  
++
+   if(proc == 0)
+     panic("sleep");
+ 
+@@ -375,12 +430,12 @@ sleep(void *chan, struct spinlock *lk)
+   }
+ 
+   // Go to sleep.
+-  proc->chan = chan;
+-  proc->state = SLEEPING;
++  thread->chan = chan;
++  thread->state = SLEEPING;
+   sched();
+ 
+   // Tidy up.
+-  proc->chan = 0;
++  thread->chan = 0;
+ 
+   // Reacquire original lock.
+   if(lk != &ptable.lock){  //DOC: sleeplock2
+@@ -396,10 +451,13 @@ static void
+ wakeup1(void *chan)
+ {
+   struct proc *p;
+-
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == SLEEPING && p->chan == chan)
+-      p->state = RUNNABLE;
++  struct thread *t;
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    for(t = p->threads; t < &p->threads[NTHREAD] ; t++){
++      if(t->state == SLEEPING && t->chan == chan)
++        t->state = RUNNABLE;
++    }
++  }
+ }
+ 
+ // Wake up all processes sleeping on chan.
+@@ -417,56 +475,295 @@ wakeup(void *chan)
+ int
+ kill(int pid)
+ {
+-  struct proc *p;
+-
+-  acquire(&ptable.lock);
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->pid == pid){
+-      p->killed = 1;
+-      // Wake process from sleep if necessary.
+-      if(p->state == SLEEPING)
+-        p->state = RUNNABLE;
+-      release(&ptable.lock);
+-      return 0;
+-    }
+-  }
+-  release(&ptable.lock);
++  // struct proc *p;
++
++  // acquire(&ptable.lock);
++  // for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++  //   if(p->pid == pid){
++  //     p->killed = 1;
++  //     // Wake process from sleep if necessary.
++  //     // if(p->state == SLEEPING)
++  //     //   p->state = RUNNABLE;
++  //     release(&ptable.lock);
++  //     return 0;
++  //   }
++  // }
++  // release(&ptable.lock);
+   return -1;
+ }
+ 
+-//PAGEBREAK: 36
++// PAGEBREAK: 36
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+ // No lock to avoid wedging a stuck machine further.
+ void
+ procdump(void)
+ {
+-  static char *states[] = {
++  static char *pstates[] = {
++  [PUNUSED]    "p_unused",
++  [PEMBRYO]    "p_embryo",
++  [PREADY]     "p_ready",
++  [PZOMBIE]    "p_zombie",
++  };
++  static char *tstates[] = {
+   [UNUSED]    "unused",
+   [EMBRYO]    "embryo",
+-  [SLEEPING]  "sleep ",
+-  [RUNNABLE]  "runble",
+-  [RUNNING]   "run   ",
+-  [ZOMBIE]    "zombie"
++  [SLEEPING]    "sleeping",
++  [RUNNABLE]    "runnable",
++  [RUNNING]    "running",
++  [ZOMBIE]    "zombie",
+   };
+-  int i;
++  // int i;
+   struct proc *p;
+-  char *state;
+-  uint pc[10];
++  struct thread *t;  
++  char *pstate;
++  char *tstate;
++  // uint pc[10];
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->state == UNUSED)
++    for(t = p->threads; t < &p->threads[NTHREAD] ; t++){
++      if(p->state == PUNUSED || t->state == UNUSED)
++        continue;
++      if(p->state >= 0 && p->state < NELEM(pstates) && pstates[p->state]){
++        pstate = pstates[p->state];
++        tstate = tstates[t->state];
++      }else{
++        pstate = "???";
++        tstate = "???";
++      }
++      cprintf("proc = %d %s %s    ", p->pid, pstate, p->name);
++      cprintf("thread = %d %s", t->tid, tstate);
++      // if(p->state == SLEEPING){
++      //   getcallerpcs((uint*)thread->context->ebp+2, pc);
++      //   for(i=0; i<10 && pc[i] != 0; i++)
++      //     cprintf(" %p", pc[i]);
++      // }
++      cprintf("\n");
++    }
++  }
++}
++
++int
++kthread_create(void*(*start_func)(), void* stack, int stack_size)
++{
++
++  struct thread *t;
++  char *sp;
++
++  acquire(&proc->plock);
++
++  for(t = proc->threads; t < &proc->threads[NTHREAD] ; t++)
++    if(t->state == UNUSED)
++      goto found;
++  release(&proc->plock);
++  return -1;
++
++found:
++  t->state = EMBRYO;
++  t->tid =  nexttid++;
++  t->parent = proc; 
++  
++  // Allocate kernel stack.
++  if((t->kstack = kalloc()) == 0){
++    t->state = UNUSED;
++    release(&proc->plock);    
++    return -1;
++  }
++
++  sp = t->kstack + KSTACKSIZE;
++  
++  // Leave room for trap frame.
++  sp -= sizeof *t->tf;
++  t->tf = (struct trapframe*)sp;
++  
++  // Set up new context to start executing at forkret,
++  // which returns to trapret.
++  sp -= 4;
++  *(uint*)sp = (uint)trapret;
++
++  sp -= sizeof *t->context;
++  t->context = (struct context*)sp;
++  memset(t->context, 0, sizeof *t->context);
++  t->context->eip = (uint)forkret;
++
++  *t->tf = *thread->tf;
++  t->tf->eip = (uint)start_func;
++  t->tf->esp = (uint)(stack + stack_size);
++
++  t->state  = RUNNABLE;
++
++  release(&proc->plock);
++
++  return t->tid;
++}
++
++void
++kthread_exit(void)
++{
++
++  struct thread *t;
++
++  acquire(&ptable.lock);
++  acquire(&proc->plock);
++
++  for(t = proc->threads; t < &proc->threads[NTHREAD] ; t++){
++    // thread might be sleeping in wait().
++    wakeup1(t);
++  }
++
++  int bool=1;
++  for(t = proc->threads; t < &proc->threads[NTHREAD] ; t++){
++    if(t->state != UNUSED && t->state != ZOMBIE && t!=thread)
++      bool=0;
++  }
++  if (bool){
++    release(&ptable.lock);
++    release(&proc->plock); 
++    exit();
++  }
++
++  // Jump into the scheduler, never to return.
++  thread->state = ZOMBIE;
++  release(&proc->plock); 
++  sched();
++  panic("zombie exit");
++}
++
++int
++kthread_join(int thread_id)
++{
++  int found, tid;
++  struct thread *t;
++
++  acquire(&proc->plock);
++  for(;;){
++    // Scan through table looking for zombie children.
++    found = 0;
++    for(t = proc->threads; t < &proc->threads[NTHREAD] ; t++){
++      if(t->tid != thread_id)
++        continue;
++      found = 1;
++      if(t->state == ZOMBIE){
++        // Found one.
++        if (t->kstack) kfree(t->kstack);
++        t->kstack = 0;
++        tid = t->tid;
++        t->tid = 0;
++        t->parent = 0;
++        t->killed = 0;
++        t->state = UNUSED;
++        release(&proc->plock);
++        return tid;
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!found || thread->killed){
++      release(&proc->plock);
++      return -1;
++    }
++
++    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(thread, &proc->plock);  //DOC: wait-sleep
++  }
++}
++
++int kthread_mutex_alloc(void){
++  acquire(&mlock);
++  struct kthread_mutex_t *m;
++  for(m = mutexes; m < &mutexes[MAX_MUTEXES] ; m++){
++    if (m->id==0){
++      m->id =  nextmid++;
++      m->thread = 0;
++      m->proc=proc;
++      m->locked=0;
++      release(&mlock);
++      return m->id;
++    } 
++  }
++  release(&mlock);
++  return -1;
++}
++
++int kthread_mutex_dealloc(int mutex_id){
++  acquire(&mlock);
++  struct kthread_mutex_t *m;
++  for(m = mutexes; m < &mutexes[MAX_MUTEXES] ; m++){
++    if (m->id==mutex_id){
++      m->id =  0;
++      m->thread = 0;
++      m->locked= 0;
++      release(&mlock);
++      return 0;
++    } 
++  }
++  release(&mlock);
++  return -1;
++}
++
++int kthread_mutex_lock(int mutex_id){
++
++  acquire(&mlock);
++  struct kthread_mutex_t *m;
++  for(m = mutexes; m < &mutexes[MAX_MUTEXES] ; m++){
++    if (m->id!=mutex_id)
+       continue;
+-    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+-      state = states[p->state];
+-    else
+-      state = "???";
+-    cprintf("%d %s %s", p->pid, state, p->name);
+-    if(p->state == SLEEPING){
+-      getcallerpcs((uint*)p->context->ebp+2, pc);
+-      for(i=0; i<10 && pc[i] != 0; i++)
+-        cprintf(" %p", pc[i]);
++    if(m->proc!=proc){
++      release(&mlock);
++      return -1;
++    }
++    if(m->locked && m->thread==thread){
++      release(&mlock);
++      return -1;
++    }
++
++    // The xchg is atomic.
++    while(xchg(&m->locked, 1) != 0){
++      release(&mlock);
++      yield();
++      acquire(&mlock);
+     }
+-    cprintf("\n");
++
++    // // Tell the C compiler and the processor to not move loads or stores
++    // // past this point, to ensure that the critical section's memory
++    // // references happen after the lock is acquired.
++    // __sync_synchronize();
++
++    m->thread=thread;
++    release(&mlock);
++    return 0;
+   }
++  release(&mlock);
++  return -1;
++
+ }
++
++int kthread_mutex_unlock(int mutex_id){
++
++  acquire(&mlock);
++  struct kthread_mutex_t *m;
++  for(m = mutexes; m < &mutexes[MAX_MUTEXES] ; m++){
++    if (m->id!=mutex_id)
++      continue;
++    if(m->proc!=proc){
++      release(&mlock);
++      return -1;    
++    }
++    if(!m->locked || m->thread!=thread){
++      release(&mlock);
++      return -1;
++    }
++
++    // // Tell the C compiler and the processor to not move loads or stores
++    // // past this point, to ensure that the critical section's memory
++    // // references happen after the lock is acquired.
++    // __sync_synchronize();
++
++    m->thread=0;
++    m->locked=0;
++    release(&mlock);
++    return 0;
++  }
++  release(&mlock);
++  return -1;
++}
+\ No newline at end of file
+diff --git a/proc.h b/proc.h
+index d1597cf..4cba9c7 100644
+--- a/proc.h
++++ b/proc.h
+@@ -1,6 +1,6 @@
+ // Per-CPU state
+ struct cpu {
+-  uchar id;                    // Local APIC ID; index into cpus[] below
++  uchar apicid;                // Local APIC ID
+   struct context *scheduler;   // swtch() here to enter scheduler
+   struct taskstate ts;         // Used by x86 to find stack for interrupt
+   struct segdesc gdt[NSEGS];   // x86 global descriptor table
+@@ -11,6 +11,7 @@ struct cpu {
+   // Cpu-local storage variables; see below
+   struct cpu *cpu;
+   struct proc *proc;           // The currently-running process.
++  struct thread *thread;           // The currently-running process.
+ };
+ 
+ extern struct cpu cpus[NCPU];
+@@ -26,6 +27,7 @@ extern int ncpu;
+ // in thread libraries such as Linux pthreads.
+ extern struct cpu *cpu asm("%gs:0");       // &cpus[cpunum()]
+ extern struct proc *proc asm("%gs:4");     // cpus[cpunum()].proc
++extern struct thread *thread asm("%gs:8");
+ 
+ //PAGEBREAK: 17
+ // Saved registers for kernel context switches.
+@@ -46,23 +48,28 @@ struct context {
+   uint eip;
+ };
+ 
+-enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++enum procstate { PUNUSED, PEMBRYO, PZOMBIE, PREADY};
++#include "kthread.h"
+ 
+ // Per-process state
+ struct proc {
+   uint sz;                     // Size of process memory (bytes)
+   pde_t* pgdir;                // Page table
+-  char *kstack;                // Bottom of kernel stack for this process
++  // char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+   int pid;                     // Process ID
+   struct proc *parent;         // Parent process
+-  struct trapframe *tf;        // Trap frame for current syscall
+-  struct context *context;     // swtch() here to run process
+-  void *chan;                  // If non-zero, sleeping on chan
++  // struct thread *parent_t;
++  // struct trapframe *tf;        // Trap frame for current syscall
++  // struct context *context;     // swtch() here to run process
++  // void *chan; // TBD                 // If non-zero, sleeping on chan
+   int killed;                  // If non-zero, have been killed
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  
++  struct spinlock plock;
++  struct thread threads[NTHREAD];
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+@@ -70,3 +77,4 @@ struct proc {
+ //   original data and bss
+ //   fixed-size stack
+ //   expandable heap
++
+diff --git a/spinlock.c b/spinlock.c
+index a5f0b21..2ee3a41 100644
+--- a/spinlock.c
++++ b/spinlock.c
+@@ -6,8 +6,8 @@
+ #include "x86.h"
+ #include "memlayout.h"
+ #include "mmu.h"
+-#include "proc.h"
+ #include "spinlock.h"
++#include "proc.h"
+ 
+ void
+ initlock(struct spinlock *lk, char *name)
+@@ -102,8 +102,9 @@ pushcli(void)
+ 
+   eflags = readeflags();
+   cli();
+-  if(cpu->ncli++ == 0)
++  if(cpu->ncli == 0)
+     cpu->intena = eflags & FL_IF;
++  cpu->ncli += 1;
+ }
+ 
+ void
+diff --git a/syscall.c b/syscall.c
+index 5d3be9d..f082314 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -3,6 +3,7 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "x86.h"
+ #include "syscall.h"
+@@ -45,7 +46,7 @@ fetchstr(uint addr, char **pp)
+ int
+ argint(int n, int *ip)
+ {
+-  return fetchint(proc->tf->esp + 4 + 4*n, ip);
++  return fetchint(thread->tf->esp + 4 + 4*n, ip);
+ }
+ 
+ // Fetch the nth word-sized system call argument as a pointer
+@@ -98,6 +99,14 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_kthread_create(void);
++extern int sys_kthread_id(void);
++extern int sys_kthread_exit(void);
++extern int sys_kthread_join(void);
++extern int sys_kthread_mutex_alloc(void);
++extern int sys_kthread_mutex_dealloc(void);
++extern int sys_kthread_mutex_lock(void);
++extern int sys_kthread_mutex_unlock(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -121,6 +130,14 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_kthread_create]   sys_kthread_create,
++[SYS_kthread_id]   sys_kthread_id,
++[SYS_kthread_exit]   sys_kthread_exit,
++[SYS_kthread_join]   sys_kthread_join,
++[SYS_kthread_mutex_alloc]   sys_kthread_mutex_alloc,
++[SYS_kthread_mutex_dealloc]   sys_kthread_mutex_dealloc,
++[SYS_kthread_mutex_lock]   sys_kthread_mutex_lock,
++[SYS_kthread_mutex_unlock]   sys_kthread_mutex_unlock,
+ };
+ 
+ void
+@@ -128,12 +145,12 @@ syscall(void)
+ {
+   int num;
+ 
+-  num = proc->tf->eax;
++  num = thread->tf->eax;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    proc->tf->eax = syscalls[num]();
++    thread->tf->eax = syscalls[num]();
+   } else {
+     cprintf("%d %s: unknown sys call %d\n",
+             proc->pid, proc->name, num);
+-    proc->tf->eax = -1;
++    thread->tf->eax = -1;
+   }
+ }
+diff --git a/syscall.h b/syscall.h
+index bc5f356..a2b9bf9 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,11 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_kthread_create  22
++#define SYS_kthread_id  23
++#define SYS_kthread_exit  24
++#define SYS_kthread_join  25
++#define SYS_kthread_mutex_alloc  26
++#define SYS_kthread_mutex_dealloc  27
++#define SYS_kthread_mutex_lock  28
++#define SYS_kthread_mutex_unlock  29
+\ No newline at end of file
+diff --git a/sysfile.c b/sysfile.c
+index aaeccc5..9bff7ca 100644
+--- a/sysfile.c
++++ b/sysfile.c
+@@ -9,6 +9,7 @@
+ #include "param.h"
+ #include "stat.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "fs.h"
+ #include "file.h"
+diff --git a/sysproc.c b/sysproc.c
+index 6b585e0..e1f61fa 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -5,6 +5,7 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ 
+ int
+@@ -89,3 +90,70 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_kthread_create(void)
++{
++  void*(*start_func)();
++  void* stack;
++  int stack_size;
++  if(argint(2, &stack_size) < 0 || argptr(0, (void*)&start_func, 4) < 0 || argptr(1, (void*)&stack, 4) < 0)
++    return -1;
++  return kthread_create(start_func, stack, stack_size);
++}
++
++int
++sys_kthread_id(void)
++{
++  return thread->tid;
++}
++
++int
++sys_kthread_exit(void)
++{
++  kthread_exit();
++  return 0;
++}
++
++int
++sys_kthread_join(void)
++{
++  int thread_id;
++
++  if(argint(0, &thread_id) < 0)
++    return -1;
++
++  return kthread_join(thread_id);
++}
++
++int sys_kthread_mutex_alloc(void){
++
++  return kthread_mutex_alloc();
++}
++
++int sys_kthread_mutex_dealloc(void){
++  int mutex_id;
++
++  if(argint(0, &mutex_id) < 0)
++    return -1;
++
++  return kthread_mutex_dealloc(mutex_id);
++}
++
++int sys_kthread_mutex_lock(void){
++  int mutex_id;
++
++  if(argint(0, &mutex_id) < 0)
++    return -1;
++
++  return kthread_mutex_lock(mutex_id);
++}
++
++int sys_kthread_mutex_unlock(void){
++  int mutex_id;
++
++  if(argint(0, &mutex_id) < 0)
++    return -1;
++
++  return kthread_mutex_unlock(mutex_id);
++}
+\ No newline at end of file
+diff --git a/trap.c b/trap.c
+index 20ae62d..b8a81b3 100644
+--- a/trap.c
++++ b/trap.c
+@@ -3,10 +3,10 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "x86.h"
+ #include "traps.h"
+-#include "spinlock.h"
+ 
+ // Interrupt descriptor table (shared by all CPUs).
+ struct gatedesc idt[256];
+@@ -39,7 +39,7 @@ trap(struct trapframe *tf)
+   if(tf->trapno == T_SYSCALL){
+     if(proc->killed)
+       exit();
+-    proc->tf = tf;
++    thread->tf = tf;
+     syscall();
+     if(proc->killed)
+       exit();
+@@ -48,7 +48,7 @@ trap(struct trapframe *tf)
+ 
+   switch(tf->trapno){
+   case T_IRQ0 + IRQ_TIMER:
+-    if(cpu->id == 0){
++    if(cpunum() == 0){
+       acquire(&tickslock);
+       ticks++;
+       wakeup(&ticks);
+@@ -74,7 +74,7 @@ trap(struct trapframe *tf)
+   case T_IRQ0 + 7:
+   case T_IRQ0 + IRQ_SPURIOUS:
+     cprintf("cpu%d: spurious interrupt at %x:%x\n",
+-            cpu->id, tf->cs, tf->eip);
++            cpunum(), tf->cs, tf->eip);
+     lapiceoi();
+     break;
+ 
+@@ -83,13 +83,13 @@ trap(struct trapframe *tf)
+     if(proc == 0 || (tf->cs&3) == 0){
+       // In kernel, it must be our mistake.
+       cprintf("unexpected trap %d from cpu %d eip %x (cr2=0x%x)\n",
+-              tf->trapno, cpu->id, tf->eip, rcr2());
++              tf->trapno, cpunum(), tf->eip, rcr2());
+       panic("trap");
+     }
+     // In user space, assume process misbehaved.
+     cprintf("pid %d %s: trap %d err %d on cpu %d "
+             "eip 0x%x addr 0x%x--kill proc\n",
+-            proc->pid, proc->name, tf->trapno, tf->err, cpu->id, tf->eip,
++            proc->pid, proc->name, tf->trapno, tf->err, cpunum(), tf->eip,
+             rcr2());
+     proc->killed = 1;
+   }
+@@ -97,15 +97,27 @@ trap(struct trapframe *tf)
+   // Force process exit if it has been killed and is in user space.
+   // (If it is still executing in the kernel, let it keep running
+   // until it gets to the regular system call return.)
+-  if(proc && proc->killed && (tf->cs&3) == DPL_USER)
++  if(proc && proc->killed && (tf->cs&3) == DPL_USER){
+     exit();
++  }
++
++  // Check if the process has been killed since we yielded
++  if(proc && thread && thread->killed && (tf->cs&3) == DPL_USER){
++    kthread_exit();
++  }
+ 
+   // Force process to give up CPU on clock tick.
+   // If interrupts were on while locks held, would need to check nlock.
+-  if(proc && proc->state == RUNNING && tf->trapno == T_IRQ0+IRQ_TIMER)
++  if(proc && thread->state == RUNNING && tf->trapno == T_IRQ0+IRQ_TIMER)
+     yield();
+ 
+   // Check if the process has been killed since we yielded
+-  if(proc && proc->killed && (tf->cs&3) == DPL_USER)
++  if(proc && proc->killed && (tf->cs&3) == DPL_USER){
+     exit();
++  }
++
++  // Check if the process has been killed since we yielded
++  if(proc && thread && thread->killed && (tf->cs&3) == DPL_USER){
++    kthread_exit();
++  }
+ }
+diff --git a/user.h b/user.h
+index f45b8d5..0e83886 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,14 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int kthread_create(void*(*start_func)(), void* stack, int stack_size);
++int kthread_id();
++void kthread_exit();
++int kthread_join(int thread_id);
++int kthread_mutex_alloc(void);
++int kthread_mutex_dealloc(int mutex_id);
++int kthread_mutex_lock(int mutex_id);
++int kthread_mutex_unlock(int mutex_id);
+ 
+ // ulib.c
+ int stat(char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..e5af113 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,11 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(kthread_create)
++SYSCALL(kthread_id)
++SYSCALL(kthread_exit)
++SYSCALL(kthread_join)
++SYSCALL(kthread_mutex_alloc)
++SYSCALL(kthread_mutex_dealloc)
++SYSCALL(kthread_mutex_lock)
++SYSCALL(kthread_mutex_unlock)
+\ No newline at end of file
+diff --git a/vm.c b/vm.c
+index c8b8d35..77d69f0 100644
+--- a/vm.c
++++ b/vm.c
+@@ -4,6 +4,7 @@
+ #include "x86.h"
+ #include "memlayout.h"
+ #include "mmu.h"
++#include "spinlock.h"
+ #include "proc.h"
+ #include "elf.h"
+ 
+@@ -27,8 +28,8 @@ seginit(void)
+   c->gdt[SEG_UCODE] = SEG(STA_X|STA_R, 0, 0xffffffff, DPL_USER);
+   c->gdt[SEG_UDATA] = SEG(STA_W, 0, 0xffffffff, DPL_USER);
+ 
+-  // Map cpu and curproc -- these are private per cpu.
+-  c->gdt[SEG_KCPU] = SEG(STA_W, &c->cpu, 8, 0);
++  // Map cpu and proc -- these are private per cpu.
++  c->gdt[SEG_KCPU] = SEG(STA_W, &c->cpu, 12, 0);
+ 
+   lgdt(c->gdt, sizeof(c->gdt));
+   loadgs(SEG_KCPU << 3);
+@@ -167,7 +168,7 @@ switchuvm(struct proc *p)
+   cpu->gdt[SEG_TSS] = SEG16(STS_T32A, &cpu->ts, sizeof(cpu->ts)-1, 0);
+   cpu->gdt[SEG_TSS].s = 0;
+   cpu->ts.ss0 = SEG_KDATA << 3;
+-  cpu->ts.esp0 = (uint)proc->kstack + KSTACKSIZE;
++  cpu->ts.esp0 = (uint)thread->kstack + KSTACKSIZE;
+   // setting IOPL=0 in eflags *and* iomb beyond the tss segment limit
+   // forbids I/O instructions (e.g., inb and outb) from user space
+   cpu->ts.iomb = (ushort) 0xFFFF;
